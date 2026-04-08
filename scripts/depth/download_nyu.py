@@ -46,7 +46,6 @@ def download_nyu(config: dict):
     val_size = config["depth_labels"]["val_split_size"]
     train_size = config["dataset"]["splits"]["train"]
     test_size = config["dataset"]["splits"]["test"]
-    total_hf_train = val_size + train_size  # 120 + 675 = 795
 
     print("Loading NYU Depth V2 from HuggingFace Hub (streaming)...")
     print("(Downloads images on-the-fly; cached by HuggingFace locally after that)")
@@ -60,7 +59,7 @@ def download_nyu(config: dict):
     val_iter = hf_train.take(val_size)
     val_count = _stream_and_save("val", val_iter, val_size, raw_dir)
 
-    # --- train split: indices val_size .. total_hf_train-1 ---
+    # --- train split: indices val_size .. val_size+train_size-1 ---
     train_iter = hf_train.skip(val_size).take(train_size)
     train_count = _stream_and_save("train", train_iter, train_size, raw_dir)
 
