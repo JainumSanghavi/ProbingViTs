@@ -8,4 +8,4 @@ tqdm
 matplotlib
 scikit-learn
 pyyaml
-datasets
+datasets<4
