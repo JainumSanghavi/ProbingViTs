@@ -1,0 +1,64 @@
+# Dataset
+dataset:
+  name: "NYUDepthV2"
+  raw_dir: "data/depth_raw"
+  processed_dir: "data/depth_processed"
+  cached_dir: "data/depth_cached"
+  splits:
+    train: 675   # HF train[120:]
+    val: 120     # HF train[:120]
+    test: 654    # HF validation split
+
+# Model (same as boundary experiment)
+model:
+  name: "google/vit-base-patch16-224-in21k"
+  patch_size: 16
+  image_size: 224
+  num_patches: 196
+  hidden_dim: 768
+  num_layers: 13
+
+# Depth labels
+depth_labels:
+  max_depth: 10.0       # NYU Depth V2 max depth in meters
+  val_split_size: 120   # images carved from HF train for validation
+
+# Feature extraction
+extraction:
+  dtype: "float16"
+  batch_size: 1
+  models: ["pretrained", "random"]
+
+# Probe training
+training:
+  probe_types: ["linear", "mlp"]
+  layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  optimizer:
+    name: "adam"
+    lr: 0.001
+    weight_decay: 0.0001
+  loss: "mse"
+  batch_size: 512
+  max_epochs: 100
+  early_stopping:
+    patience: 10
+    metric: "val_mae"
+
+# MLP probe
+mlp_probe:
+  hidden_dim: 256
+  dropout: 0.1
+
+# Evaluation
+evaluation:
+  metrics: ["mae", "rmse"]
+
+# Results
+results:
+  metrics_dir: "results/depth/metrics"
+  figures_dir: "results/depth/figures"
+  checkpoints_dir: "results/depth/checkpoints"
+
+# Misc
+seed: 42
+num_workers: 0
