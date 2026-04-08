@@ -1,0 +1,69 @@
+# Dataset
+dataset:
+  name: "BSDS500"
+  raw_dir: "data/raw/BSDS500"
+  processed_dir: "data/processed"
+  cached_dir: "data/cached"
+  splits:
+    train: 200
+    val: 100
+    test: 200
+
+# Model
+model:
+  name: "google/vit-base-patch16-224-in21k"
+  patch_size: 16
+  image_size: 224
+  num_patches: 196  # 14x14
+  hidden_dim: 768
+  num_layers: 13  # embedding + 12 transformer blocks
+
+# Patch labels
+patch_labels:
+  annotator_threshold: 0.5  # majority vote threshold
+  boundary_threshold: 0.0   # any boundary pixel in patch -> label=1
+
+# Feature extraction
+extraction:
+  dtype: "float16"
+  batch_size: 1  # per-image extraction
+  models: ["pretrained", "random"]
+
+# Probe training
+training:
+  probe_types: ["linear", "mlp"]
+  layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+  optimizer:
+    name: "adam"
+    lr: 0.001
+    weight_decay: 0.0001
+  loss: "bce_with_logits"
+  batch_size: 512
+  max_epochs: 100
+  early_stopping:
+    patience: 10
+    metric: "val_f1"
+
+# MLP probe
+mlp_probe:
+  hidden_dim: 256
+  dropout: 0.1
+
+# Conv probe
+conv_probe:
+  hidden_dim: 128
+
+# Evaluation
+evaluation:
+  metrics: ["accuracy", "f1", "precision", "recall", "average_precision"]
+  threshold: 0.5
+
+# Results
+results:
+  metrics_dir: "results/metrics"
+  figures_dir: "results/figures"
+  checkpoints_dir: "results/checkpoints"
+
+# Misc
+seed: 42
+num_workers: 0  # MPS doesn't support multiprocessing DataLoader well
