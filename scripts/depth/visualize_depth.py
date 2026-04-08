@@ -10,10 +10,12 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+NYU_MAX_DEPTH = 10.0  # NYU Depth V2 max depth in meters (labels normalized by this)
+
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.probes.linear_probe import get_probe
-from src.training.depth_trainer import DepthProbeTrainer
 from src.data.depth_dataset import DepthDataModule
 
 
@@ -61,13 +63,13 @@ def _run_inference(config, device, model_type, probe_type, layer, split="test"):
     )
     loader = dm.test_dataloader() if split == "test" else dm.val_dataloader()
 
-    trainer = DepthProbeTrainer(model=probe, device=device)
-    trainer.model.eval()
+    probe = probe.to(device)
+    probe.eval()
 
     all_preds, all_labels = [], []
     with torch.no_grad():
         for feats, lbls in loader:
-            preds = trainer.model(feats.to(device)).cpu()
+            preds = probe(feats.to(device)).cpu()
             all_preds.append(preds)
             all_labels.append(lbls)
 
@@ -76,12 +78,10 @@ def _run_inference(config, device, model_type, probe_type, layer, split="test"):
 
 def _resize_patch_grid(arr_14x14):
     """Resize a 14x14 float32 array to 224x224 using PIL BILINEAR."""
-    from PIL import Image as PILImage
-    import numpy as np
     arr = arr_14x14.astype(np.float32)
     # PIL MODE 'F' handles float32
-    pil_img = PILImage.fromarray(arr, mode='F')
-    return np.array(pil_img.resize((224, 224), PILImage.BILINEAR))
+    pil_img = Image.fromarray(arr, mode='F')
+    return np.array(pil_img.resize((224, 224), Image.BILINEAR))
 
 
 def plot_layerwise_mae(results: dict, figures_dir: Path):
@@ -136,7 +136,7 @@ def plot_pretrained_vs_random(results: dict, figures_dir: Path):
 
 
 def plot_cross_task(depth_results: dict, figures_dir: Path):
-    boundary_path = Path("results/metrics/test_results.json")
+    boundary_path = Path(__file__).parent.parent.parent / "results/metrics/test_results.json"
     if not boundary_path.exists():
         print("  Skipping cross_task_layerwise.png (boundary results not found)")
         return
@@ -153,8 +153,11 @@ def plot_cross_task(depth_results: dict, figures_dir: Path):
     if "pretrained" in boundary_results and "linear" in boundary_results["pretrained"]:
         lm = boundary_results["pretrained"]["linear"]
         layers = sorted(lm.keys())
-        ax1.plot(layers, [lm[l]["f1"] for l in layers],
-                 color="green", marker="o", linewidth=2, label="Boundary F1 (pretrained linear)")
+        if not layers or "f1" not in lm.get(layers[0], {}):
+            print("  Warning: boundary results missing 'f1' key, skipping boundary curve")
+        else:
+            ax1.plot(layers, [lm[l]["f1"] for l in layers],
+                     color="green", marker="o", linewidth=2, label="Boundary F1 (pretrained linear)")
     if "pretrained" in depth_results and "linear" in depth_results["pretrained"]:
         lm = depth_results["pretrained"]["linear"]
         layers = sorted(lm.keys())
@@ -272,7 +275,7 @@ def plot_scatter(config: dict, device: torch.device, results: dict, figures_dir:
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     mae = float(np.abs(preds - labels).mean())
-    ax.text(0.05, 0.92, f"MAE = {mae:.4f} ({mae*10:.3f}m)", transform=ax.transAxes, fontsize=11)
+    ax.text(0.05, 0.92, f"MAE = {mae:.4f} ({mae*NYU_MAX_DEPTH:.3f}m)", transform=ax.transAxes, fontsize=11)
     plt.tight_layout()
     fig.savefig(figures_dir / "depth_scatter_best_layer.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
