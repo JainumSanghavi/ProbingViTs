@@ -94,7 +94,8 @@ def main():
         if results["pretrained"][pt]:
             best_layer = min(results["pretrained"][pt], key=lambda l: results["pretrained"][pt][l]["mae"])
             best_mae = results["pretrained"][pt][best_layer]["mae"]
-            print(f"  {pt}: layer {best_layer}, MAE={best_mae:.4f} ({best_mae*10:.3f}m)")
+            max_depth = config["depth_labels"]["max_depth"]
+            print(f"  {pt}: layer {best_layer}, MAE={best_mae:.4f} ({best_mae*max_depth:.3f}m)")
 
 
 if __name__ == "__main__":
