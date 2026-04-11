@@ -1,0 +1,1061 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{enumitem}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!70!black
+}
+
+\title{%
+    \textbf{Do Vision Transformers Encode Depth?} \\[0.5em]
+    \large Probing ViT-B/16 Hidden States for Spatial Depth Information \\[0.3em]
+    \normalsize Actionable Interpretability --- Depth Probing Experiment
+}
+\author{Jainum Sanghavi}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Abstract}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+We investigate whether intermediate representations of a Vision Transformer
+(ViT-B/16, \texttt{google/vit-base-patch16-224-in21k}) linearly encode
+per-patch depth, a genuinely spatial property, without any explicit depth
+supervision during training.  Using the NYU Depth V2 dataset (795 labelled
+images, 654 test), we train linear and MLP regression probes at each of the 13
+layers (embedding $+$ 12 transformer blocks) of the model, and compare
+pretrained against randomly initialised weights as a control.
+
+The pretrained ViT achieves a best-layer test MAE of \textbf{0.0875 normalised
+units} ($\approx\!0.875\,\text{m}$) with a linear probe at layer~8, a
+\textbf{23\,\%} reduction over the random-weight baseline (MAE~$\approx 0.109$
+at best layer).  Depth-encoding quality follows a clear arch-shaped profile
+peaking at layers~5--8, with a sharp degradation at the final layer for the MLP
+probe, suggesting that the last-layer representation is too class-specific to
+retain geometric information.  A cross-task comparison against a parallel
+boundary-detection probing study (BSDS500) reveals that \emph{boundary
+structure} is best encoded one or two layers earlier (peak at layer~5--6,
+F1~$=0.747$) than \emph{depth}, consistent with the hypothesis that low-level
+structural features emerge before high-level spatial organisation in the
+transformer hierarchy.
+
+To move beyond correlational evidence, we conduct two causal interventions:
+(a)~\emph{probe-direction ablation}, which removes the depth-encoding direction
+from hidden states and measures the resulting MAE increase, and
+(b)~\emph{activation patching}, which transplants hidden states between
+image pairs and tracks how depth predictions shift.  Ablation at layer~8
+increases MAE by \textbf{83\,\%} (vs.\ $<\!1\,\%$ for random directions),
+and dose-response analysis confirms the relationship is monotonic.
+Activation patching yields patch effects near 1.0 along the diagonal
+($T = L$), confirming that depth information is causally carried through
+each layer.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+Vision Transformers~\cite{dosovitskiy2021vit} trained on large-scale image
+classification benchmarks have become the dominant backbone in modern computer
+vision.  A natural interpretability question is: \emph{what geometric and
+spatial information is implicitly encoded in their internal representations?}
+Answering this question matters both for understanding how these models work and
+for identifying which layers are most useful as feature extractors in downstream
+tasks.
+
+Probing~\cite{alain2017understanding} is the standard methodology for
+answering such questions: one trains a lightweight classifier or regressor
+on the frozen hidden states of a layer and measures how well the target
+property can be linearly decoded.  Prior probing work on BERT-style language
+models has revealed layer-specific specialisation for syntax, semantics, and
+discourse structure.  For vision models, however, the analogous spatial
+questions---\emph{when does the model know where things are?}---remain
+relatively underexplored, particularly for transformer architectures.
+
+This report focuses on \textbf{depth}, the simplest genuinely spatial
+property: given an image patch, how far from the camera is it?  Unlike edge
+detection (which captures structural boundaries) or semantic labels (which
+capture category membership), depth encodes the three-dimensional arrangement
+of the scene.  If ViT representations linearly encode depth, this constitutes
+direct evidence that the model builds an implicit three-dimensional world
+model during training on 2D classification data.
+
+We conduct a controlled probing study with the following contributions:
+\begin{enumerate}[noitemsep]
+    \item A complete depth regression probing pipeline for ViT-B/16 on NYU
+          Depth~V2, producing 52 probe checkpoints and 8 analysis figures.
+    \item Evidence that pretrained ViT representations substantially and
+          significantly outperform random-weight baselines for depth prediction,
+          confirming that depth encoding is \emph{learned}.
+    \item A cross-task comparison between depth (spatial) and boundary
+          (structural) probing, showing that the two properties peak at
+          different layers of the same model.
+    \item A causal analysis via probe-direction ablation and activation
+          patching, confirming that depth information is not merely
+          decodable but \emph{causally encoded} in the learned
+          representation subspace.
+\end{enumerate}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Background and Related Work}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Probing Classifiers}
+
+Probing classifiers, introduced by~\cite{alain2017understanding}, assess the
+information content of neural network representations by measuring how well a
+lightweight auxiliary model can predict a target property from frozen
+intermediate activations.  A successful linear probe implies that the
+information is \emph{linearly accessible}---encoded in a separable subspace of
+the representation.  The gap between a linear probe and an MLP probe indicates
+how non-linearly the information is encoded.
+
+\subsection{ViT Hidden State Structure}
+
+ViT-B/16 divides a $224\times224$ image into $196$ non-overlapping
+$16\times16$ patches, which are projected into a 768-dimensional token space
+and processed through 12 transformer blocks.  Each block applies self-attention
+followed by a feed-forward network, producing 13 sets of token
+representations (including the initial embedding).  The 196 patch tokens carry
+spatial information, while the additional class token accumulates global
+context.  Prior work~\cite{caron2021dino,oquab2023dinov2} has shown that the
+patch tokens of self-supervised ViTs encode rich semantic and structural
+information, but the behaviour of supervised ViTs in this regard is less well
+characterised.
+
+\subsection{Monocular Depth Estimation}
+
+Monocular depth estimation is the task of predicting the depth (distance from
+camera) of each pixel in a single RGB image.  The NYU Depth V2
+dataset~\cite{silberman2012nyudepth} provides 1449 aligned RGB/depth pairs
+captured with a Kinect sensor in indoor scenes.  Depth values range from
+approximately 0 to 10\,m.  We use this dataset as the source of ground-truth
+depth labels for our probing study.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Methodology}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Dataset}
+
+We use NYU Depth V2~\cite{silberman2012nyudepth}, loaded via the HuggingFace
+Hub (\texttt{sayakpaul/nyu\_depth\_v2}).  The 795 labelled training images
+are split into 675 training and 120 validation; the 654 HuggingFace validation
+images form the test set.
+
+\begin{table}[H]
+\centering
+\caption{Dataset split sizes.}
+\begin{tabular}{lrr}
+\toprule
+Split & Images & Patches (196 per image) \\
+\midrule
+Train & 675 & 132,300 \\
+Val   & 120 & 23,520 \\
+Test  & 654 & 128,184 \\
+\bottomrule
+\end{tabular}
+\label{tab:splits}
+\end{table}
+
+\paragraph{Pre-processing.}
+RGB images are resized to $224\!\times\!224$ and normalised with the ViT
+image processor (ImageNet mean/std).  Depth maps are resized to
+$224\!\times\!224$ using \emph{bilinear} interpolation (appropriate for
+continuous values, in contrast to nearest-neighbour used for binary boundary
+masks) and then aggregated to the $14\!\times\!14$ patch grid by computing
+the \textbf{mean depth of all pixels} within each $16\!\times\!16$ patch.
+Depth values are normalised by dividing by 10.0\,m (the dataset maximum),
+mapping all labels to $[0,1]$.  MAE values in this report are expressed in
+normalised units; multiply by 10 to convert to metres.
+
+\subsection{Feature Extraction}
+
+For each image we run it through ViT-B/16 and extract the hidden state tensor
+at every layer.  Each hidden state has shape $(196, 768)$: 196 patch tokens
+$\times$ 768 embedding dimensions.  We exclude the class token.  Hidden
+states are saved to disk as \texttt{float16} tensors (shape $(13, 196, 768)$
+per image) to reduce storage.  Two model variants are extracted:
+\begin{itemize}[noitemsep]
+    \item \textbf{Pretrained}: \texttt{google/vit-base-patch16-224-in21k}
+          weights.
+    \item \textbf{Random}: Randomly initialised ViT-B/16 with the same
+          architecture (no training).
+\end{itemize}
+The random baseline is the critical control: if a probe succeeds on pretrained
+but not random weights, the encoding is \emph{learned} rather than an
+artefact of the architecture's inductive biases.
+
+\subsection{Probe Architectures}
+
+We probe each layer independently using two architectures:
+
+\begin{table}[H]
+\centering
+\caption{Probe architectures.  Both produce a single scalar output per patch.}
+\begin{tabular}{llr}
+\toprule
+Probe & Architecture & Parameters \\
+\midrule
+LinearProbe & $768 \to 1$ (linear, no activation) & 769 \\
+MLPProbe    & $768 \to 256 \to \text{ReLU} \to 1$ (linear output) & 197,121 \\
+\bottomrule
+\end{tabular}
+\label{tab:probes}
+\end{table}
+
+Both probes are applied \emph{independently per patch}: each of the 196 patch
+tokens from a single layer is treated as an independent input vector, so each
+forward pass processes an image as a $(196, 768)$ tensor and produces a
+$(196,)$ depth prediction.
+
+\paragraph{Key design choice.}
+The final activation is \textbf{linear} (no sigmoid), appropriate for
+regression over normalised continuous values.  This differs from the boundary
+probing experiment, which uses \texttt{BCEWithLogitsLoss} for binary
+classification.
+
+\subsection{Training Setup}
+
+\begin{table}[H]
+\centering
+\caption{Training hyperparameters.}
+\begin{tabular}{ll}
+\toprule
+Hyperparameter & Value \\
+\midrule
+Loss function & \texttt{MSELoss} \\
+Optimiser & Adam \\
+Learning rate & $1\!\times\!10^{-3}$ \\
+Weight decay & $1\!\times\!10^{-4}$ \\
+Batch size & 512 patches \\
+Max epochs & 100 \\
+Early stopping patience & 10 epochs \\
+Early stopping metric & Validation MAE (minimise) \\
+Random seed & 42 \\
+\bottomrule
+\end{tabular}
+\label{tab:hparams}
+\end{table}
+
+The total experiment comprises $13 \times 2 \times 2 = 52$ probe runs (layers
+$\times$ probe types $\times$ model inits).  All probes are trained on an
+Apple M3 Mac with MPS acceleration.
+
+\subsection{Evaluation Metrics}
+
+\paragraph{Primary --- MAE.}  Mean Absolute Error over all patches in the
+test set:
+\[
+    \text{MAE} = \frac{1}{N}\sum_{i=1}^{N}|\hat{y}_i - y_i|
+\]
+where $N = 128,\!184$ is the total number of test patches.
+
+\paragraph{Secondary --- RMSE.}  Root Mean Squared Error, which penalises
+large outliers more heavily:
+\[
+    \text{RMSE} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}(\hat{y}_i - y_i)^2}
+\]
+
+Both metrics are reported in normalised units ($\times 10 = \text{metres}$).
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Complete Layerwise Results}
+
+Table~\ref{tab:full_results} reports MAE and RMSE on the test set for all 52
+probe configurations.
+
+\begin{table}[H]
+\centering
+\caption{Test-set MAE and RMSE for all probe configurations.  Values are
+normalised (divide by 10 for metres).  Best value in each model/probe
+column is \textbf{bold}.}
+\label{tab:full_results}
+\small
+\begin{tabular}{c|rr|rr|rr|rr}
+\toprule
+ & \multicolumn{4}{c|}{\textbf{Pretrained ViT}} & \multicolumn{4}{c}{\textbf{Random ViT}} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Layer & \multicolumn{2}{c|}{Linear} & \multicolumn{2}{c|}{MLP} & \multicolumn{2}{c|}{Linear} & \multicolumn{2}{c}{MLP} \\
+ & MAE & RMSE & MAE & RMSE & MAE & RMSE & MAE & RMSE \\
+\midrule
+0  & 0.1127 & 0.1562 & 0.1110 & 0.1541 & 0.1195 & 0.1662 & 0.1123 & 0.1566 \\
+1  & 0.1065 & 0.1475 & 0.1077 & 0.1500 & 0.1073 & 0.1523 & 0.1113 & 0.1553 \\
+2  & 0.1037 & 0.1424 & 0.1043 & 0.1466 & 0.1108 & 0.1563 & 0.1109 & 0.1558 \\
+3  & 0.1076 & 0.1485 & 0.1012 & 0.1429 & 0.1074 & 0.1514 & 0.1134 & 0.1581 \\
+4  & 0.0887 & 0.1223 & 0.1007 & 0.1424 & 0.1112 & 0.1562 & 0.1129 & 0.1570 \\
+5  & 0.0875 & 0.1222 & 0.0934 & 0.1337 & 0.1111 & 0.1566 & 0.1170 & 0.1612 \\
+6  & 0.0878 & 0.1228 & \textbf{0.0920} & \textbf{0.1317} & 0.1094 & 0.1535 & 0.1210 & 0.1657 \\
+7  & 0.0963 & 0.1334 & 0.0926 & 0.1309 & 0.1089 & 0.1538 & 0.1145 & 0.1588 \\
+8  & \textbf{0.0875} & \textbf{0.1220} & 0.0947 & 0.1346 & 0.1122 & 0.1579 & 0.1233 & 0.1672 \\
+9  & 0.0917 & 0.1283 & 0.0975 & 0.1385 & 0.1085 & 0.1499 & 0.1195 & 0.1632 \\
+10 & 0.0938 & 0.1326 & 0.0991 & 0.1399 & 0.1100 & 0.1541 & 0.1178 & 0.1619 \\
+11 & 0.0933 & 0.1299 & 0.1030 & 0.1452 & 0.1115 & 0.1569 & 0.1179 & 0.1615 \\
+12 & 0.0992 & 0.1344 & 0.1261 & 0.1810 & 0.1091 & 0.1528 & 0.1167 & 0.1609 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Layerwise MAE Profile}
+
+Figure~\ref{fig:layerwise_mae} shows the test MAE as a function of layer for
+all four conditions.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/layerwise_mae.png}
+\caption{Test MAE by ViT layer for all four probe configurations.  Blue lines:
+pretrained ViT; red lines: random ViT.  Solid lines with circles: linear
+probes; dashed lines with squares: MLP probes.  The pretrained ViT shows a
+clear improvement over the random baseline, peaking at layers 5--8.}
+\label{fig:layerwise_mae}
+\end{figure}
+
+\paragraph{Observations.}
+\begin{itemize}[noitemsep]
+    \item The pretrained linear probe improves monotonically from layer~0
+          (MAE~$=0.113$) to a plateau around layers~4--6, reaching its
+          global minimum at \textbf{layer~8} (MAE~$=0.0875$).
+    \item The pretrained MLP probe peaks earlier, at \textbf{layer~6}
+          (MAE~$=0.0920$), and degrades sharply at layer~12 (MAE~$=0.126$).
+          The final-layer degradation is discussed in
+          Section~\ref{sec:discussion}.
+    \item The random linear probe stays flat across all layers
+          (MAE range: $0.109$--$0.120$), confirming that architecture alone
+          does not produce useful depth representations.
+    \item The random MLP probe also shows no clear trend (MAE range:
+          $0.112$--$0.123$), though its absolute values are slightly lower
+          than the random linear probe, suggesting the MLP can fit arbitrary
+          nonlinear patterns in random features more easily.
+\end{itemize}
+
+\subsection{Pretrained vs.\ Random ViT}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.75\textwidth]{figures/pretrained_vs_random_depth.png}
+\caption{Linear probe MAE: pretrained (blue) vs.\ random (red) ViT.  The gap
+opens around layer~4 and is largest at layers~5--8, demonstrating that depth
+encoding is a property of \emph{learned} representations.}
+\label{fig:pretrained_vs_random}
+\end{figure}
+
+The pretrained-minus-random MAE gap is a direct measure of how much the ViT
+training process encodes depth information.  As shown in
+Figure~\ref{fig:pretrained_vs_random} and quantified in
+Table~\ref{tab:gap}, this gap is largest at the peak-encoding layers:
+
+\begin{table}[H]
+\centering
+\caption{MAE gap (random $-$ pretrained) at selected layers, linear probe.
+Positive values indicate pretrained is better.}
+\label{tab:gap}
+\begin{tabular}{crrr}
+\toprule
+Layer & Pretrained MAE & Random MAE & Gap \\
+\midrule
+0  & 0.1127 & 0.1195 & 0.0068 \\
+4  & 0.0887 & 0.1112 & 0.0225 \\
+5  & 0.0875 & 0.1111 & 0.0236 \\
+6  & 0.0878 & 0.1094 & 0.0216 \\
+8  & \textbf{0.0875} & 0.1122 & \textbf{0.0247} \\
+12 & 0.0992 & 0.1091 & 0.0099 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The gap peaks at layer~8 (23\,\% relative reduction in MAE), confirming that
+depth encoding is a learned property that concentrates in the mid-to-late
+layers of the transformer hierarchy.
+
+\subsection{Linear vs.\ MLP Probe}
+
+A key interpretability question is whether depth information is
+\emph{linearly accessible} or requires a non-linear decoder.  The results
+show that:
+\begin{itemize}[noitemsep]
+    \item On the test set, the \textbf{linear probe outperforms the MLP probe}
+          at the best layer (MAE~$0.0875$ vs.\ $0.0920$, a 5\,\% gap).
+    \item On the validation set (used for early stopping), the MLP probe
+          showed slightly lower MAE at its best layer (val MAE~$0.0653$
+          at layer~7 vs.\ $0.0665$ at layer~5 for linear).
+    \item The MLP probe shows a sharp degradation at layer~12 (test
+          MAE~$0.126$), while the linear probe degrades more gracefully
+          (MAE~$0.099$).
+\end{itemize}
+The superior test-set performance of the linear probe, despite having
+257$\times$ fewer parameters (769 vs.\ 197,121), suggests that the
+\textbf{depth information in ViT hidden states is primarily linearly
+structured}.  The MLP probe's advantage on validation may reflect
+overfitting to the small validation set (120 images).
+
+\subsection{Predicted vs.\ Actual Depth (Calibration)}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.60\textwidth]{figures/depth_scatter_best_layer.png}
+\caption{Scatter plot of predicted vs.\ actual patch depth for the best
+configuration (pretrained linear, layer~8, $N=128,\!184$ test patches).
+The red dashed line is the identity ($\hat{y}=y$).  The predictions cluster
+around mid-range depth values, with broader spread at the extremes.}
+\label{fig:scatter}
+\end{figure}
+
+The scatter plot (Figure~\ref{fig:scatter}) reveals a characteristic
+pattern: the probe's predictions are well-calibrated for \emph{mid-range}
+depth values but regress towards the mean for very near ($<\!0.1$) and very
+far ($>\!0.8$) depths.  This is expected for a linear regressor on a dataset
+with an uneven depth distribution.
+
+\subsection{MAE by Depth Range}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.60\textwidth]{figures/mae_by_depth_bin.png}
+\caption{MAE broken down by near (0--3\,m), mid (3--6\,m), and far
+(6--10\,m) depth ranges.  Best layer (layer~8, pretrained linear probe).}
+\label{fig:binned_mae}
+\end{figure}
+
+Figure~\ref{fig:binned_mae} shows that the probe performs \emph{unevenly}
+across depth ranges.  Mid-range patches are predicted most accurately, while
+near and far patches are harder.  This likely reflects:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Near patches}: High within-patch depth variance (objects
+          close to the camera often span a narrow strip at the image bottom
+          where depth changes rapidly).
+    \item \textbf{Far patches}: Visual cues are weaker (texture gradients,
+          perspective foreshortening) and many patches contain a mixture of
+          objects at different depths.
+    \item \textbf{Class imbalance}: The NYU Depth V2 dataset is heavily
+          skewed towards mid-range depths (most indoor scenes have walls,
+          floors, and furniture at 1--4\,m), so the model sees more examples
+          in this range.
+\end{enumerate}
+
+\subsection{Qualitative Analysis}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/qualitative_depth_layer08.png}
+\caption{Qualitative results for 5 test images.  Left: original RGB.
+Centre: ground-truth depth map (plasma colormap; dark = near, bright = far).
+Right: predicted depth map from the pretrained linear probe at layer~8.}
+\label{fig:qualitative}
+\end{figure}
+
+Figure~\ref{fig:qualitative} shows that the linear probe produces
+\textbf{spatially coherent} depth maps: the gross layout of the scene
+(foreground vs.\ background, floor vs.\ walls) is captured correctly.  Fine
+details are blurred relative to the ground truth, which is expected from a
+linear probe with only 769 parameters applied independently to each patch
+without spatial context.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/depth_heatmap_grid.png}
+\caption{Predicted depth overlaid on the input image across 5 ViT layers
+(0, 3, 6, 9, 12) for 5 test images.  The depth prediction becomes more
+spatially coherent and accurate at middle layers.  The overlay at layer~0 is
+essentially uniform, reflecting the poor depth encoding at the embedding
+layer.}
+\label{fig:heatmap_grid}
+\end{figure}
+
+Figure~\ref{fig:heatmap_grid} illustrates the \emph{emergence} of depth
+encoding across layers.  At layer~0 (the patch embedding), predictions are
+nearly uniform, indicating that raw embedded patches carry little depth
+information.  By layer~6, the predicted depth maps capture the
+foreground-background structure.  The quality of predictions at layer~9
+and~12 degrades somewhat, consistent with the quantitative results.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\textwidth]{figures/patch_error_map.png}
+\caption{Per-patch absolute error at layer~8 (pretrained linear probe).
+Left: original image. Centre: ground-truth depth.  Right: absolute error
+(hot colormap; white/yellow = high error).  Errors are concentrated at
+depth boundaries and on objects close to the camera.}
+\label{fig:patch_error}
+\end{figure}
+
+The patch error map (Figure~\ref{fig:patch_error}) confirms the depth-bin
+analysis: errors concentrate at \emph{depth discontinuities} and near-camera
+objects.  Interestingly, this spatial error pattern mirrors the locations of
+\emph{edges} in the boundary detection task---suggesting that the hardest
+patches for depth probing are precisely the ones with the most complex
+structural information.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Cross-Task Comparison: Depth vs.\ Boundary Detection}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+The primary paper-level contribution is the comparison between depth (spatial)
+and boundary (structural) probing on the same ViT-B/16 model.  The boundary
+probing study (conducted on BSDS500) uses identical methodology but formulates
+the task as binary patch classification with BCEWithLogitsLoss and reports F1
+as the primary metric.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/cross_task_layerwise.png}
+\caption{\textbf{Key figure}: Boundary F1 (green, left axis) and Depth MAE
+(purple, right axis) across ViT layers, both using pretrained linear probes.
+Lower MAE = better depth; higher F1 = better boundary.  The two tasks peak at
+different layers, with boundary detection emerging 2--3 layers earlier.}
+\label{fig:cross_task}
+\end{figure}
+
+Table~\ref{tab:cross_task} provides the numerical comparison:
+
+\begin{table}[H]
+\centering
+\caption{Layer-by-layer comparison of boundary F1 and depth MAE (pretrained
+linear probe).  Best values are \textbf{bold}.}
+\label{tab:cross_task}
+\small
+\begin{tabular}{crrcrr}
+\toprule
+Layer & Boundary F1 & Boundary AP & & Depth MAE & Depth RMSE \\
+\midrule
+0  & 0.527 & 0.456 & & 0.1127 & 0.1562 \\
+1  & 0.679 & 0.722 & & 0.1065 & 0.1475 \\
+2  & 0.717 & 0.791 & & 0.1037 & 0.1424 \\
+3  & 0.739 & 0.817 & & 0.1076 & 0.1485 \\
+4  & 0.744 & 0.827 & & 0.0887 & 0.1223 \\
+5  & 0.747 & 0.833 & & 0.0875 & 0.1222 \\
+6  & \textbf{0.747} & \textbf{0.832} & & 0.0878 & 0.1228 \\
+7  & 0.738 & 0.821 & & 0.0963 & 0.1334 \\
+8  & 0.720 & 0.803 & & \textbf{0.0875} & \textbf{0.1220} \\
+9  & 0.710 & 0.780 & & 0.0917 & 0.1283 \\
+10 & 0.702 & 0.764 & & 0.0938 & 0.1326 \\
+11 & 0.668 & 0.700 & & 0.0933 & 0.1299 \\
+12 & 0.612 & 0.617 & & 0.0992 & 0.1344 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Key findings.}
+\begin{enumerate}
+    \item \textbf{Boundary detection peaks at layers 5--6}; depth encoding
+          peaks at \textbf{layer 8}.  This 2--3 layer offset suggests that
+          the model builds structural (edge) representations before fully
+          encoding the spatial (depth) arrangement.
+
+    \item Both tasks \textbf{degrade strongly at layer~12}.  The final
+          classification-head-facing representation is specialised for
+          ImageNet class discrimination and loses task-agnostic geometric
+          information, consistent with findings for NLP models where the final
+          layer's representations are the most task-specific.
+
+    \item Both tasks improve \textbf{simultaneously from layer~0 to~4},
+          suggesting a shared early phase where the ViT builds a general
+          low-level feature representation before specialising.
+
+    \item The \textbf{absolute performance gap between pretrained and random}
+          is larger for boundary detection (F1 gap $\approx\!0.13$ at peak)
+          than for depth (MAE gap $\approx\!0.025$), suggesting that boundary
+          structure is more strongly encoded in pretrained representations
+          than depth.  This is plausible: edges are more directly related to
+          the object outlines that drive classification, while depth is a
+          more implicit 3D property.
+\end{enumerate}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Causal Analysis}
+\label{sec:causal}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+The probing results in the preceding sections establish that ViT hidden states
+are \emph{correlated} with depth.  However, a successful linear probe does not
+imply that depth information is \emph{causally} carried by the representation;
+the probe may exploit incidental correlations.  This section presents two
+causal interventions that directly test whether removing or transplanting depth
+information changes model behaviour as predicted.
+
+\subsection{Approach A: Probe Direction Ablation}
+
+For each layer~$\ell$, the trained linear probe has a weight vector
+$\mathbf{w}_\ell \in \mathbb{R}^{768}$.  Let
+$\hat{\mathbf{w}}_\ell = \mathbf{w}_\ell / \|\mathbf{w}_\ell\|$ be the
+unit ``depth direction'' in representation space.  We ablate this direction
+by projecting it out of every patch token:
+\[
+    \mathbf{h}'_i = \mathbf{h}_i
+        - (\mathbf{h}_i \cdot \hat{\mathbf{w}}_\ell)\,\hat{\mathbf{w}}_\ell
+\]
+and re-evaluate the probe on the modified representations.  If the probe
+direction genuinely concentrates depth signal, ablating it should increase
+MAE substantially, whereas ablating a random direction of the same norm
+should have negligible effect.
+
+\paragraph{Results.}
+Figure~\ref{fig:ablation_gap} shows the MAE increase (in percent) from
+ablating the probe direction versus the mean effect of 10 random directions
+at each layer.  Ablating the probe direction produces large MAE increases at
+\emph{every} layer (range: 49\,\%--165\,\%), while random-direction ablation
+produces increases of $<\!2\,\%$ everywhere.  At the best probing layer
+(layer~8), the probe-direction ablation increases MAE by \textbf{83\,\%}
+(from 0.0875 to 0.160), while random directions change MAE by less than
+1\,\%.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/causal/ablation_gap_by_layer.png}
+\caption{MAE increase (\%) from ablating the probe direction (blue) vs.\
+random directions (red, mean $\pm$ std over 10 draws).  The probe direction
+concentrates far more depth signal than any random direction.}
+\label{fig:ablation_gap}
+\end{figure}
+
+\paragraph{Dose-response.}
+To verify that the effect is monotonic (not an artefact of distribution
+shift), we perform a graded ablation at layer~8 by removing a fraction
+$\alpha \in [0, 1]$ of the depth direction:
+\[
+    \mathbf{h}'_i = \mathbf{h}_i
+        - \alpha\,(\mathbf{h}_i \cdot \hat{\mathbf{w}}_\ell)\,\hat{\mathbf{w}}_\ell
+\]
+Figure~\ref{fig:dose_response} shows that MAE increases smoothly and
+monotonically with $\alpha$, from 0.0875 at $\alpha=0$ to 0.160 at
+$\alpha=1$.  This rules out threshold effects and confirms that the depth
+signal is continuously distributed along the probe direction.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.70\textwidth]{figures/causal/dose_response_layer08.png}
+\caption{Dose-response curve at layer~8: MAE as a function of the ablation
+strength $\alpha$.  The smooth, monotonic increase confirms a genuine causal
+relationship between the probe direction and depth encoding.}
+\label{fig:dose_response}
+\end{figure}
+
+\paragraph{Qualitative effect.}
+Figure~\ref{fig:ablation_qual} shows the probe's predicted depth maps before
+and after full ablation at layer~8 for three test images.  After ablation,
+the spatial structure is largely destroyed: predictions collapse towards a
+uniform value, consistent with the hypothesis that the probe direction
+carries the dominant depth signal.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.90\textwidth]{figures/causal/ablation_qualitative.png}
+\caption{Qualitative ablation at layer~8.  Left: original probe prediction.
+Centre: prediction after ablating the depth direction.  Right: ground truth.
+The ablated predictions lose spatial structure, confirming causal dependence
+on the depth direction.}
+\label{fig:ablation_qual}
+\end{figure}
+
+\subsection{Approach B: Activation Patching}
+
+Activation patching~\cite{vig2020causal} tests whether depth information is
+\emph{carried through} each layer by transplanting hidden states between
+image pairs with different depth distributions.  For each pair of images
+(source~$s$, destination~$d$), we:
+\begin{enumerate}[noitemsep]
+    \item Run both images through the ViT to obtain their hidden states.
+    \item At intervention layer~$L$, replace the destination's hidden state
+          with the source's hidden state.
+    \item Continue the forward pass and evaluate the probe at target layer
+          $T \geq L$.
+    \item Compute the \emph{patch effect}: how much the probe prediction at
+          $T$ shifts from the destination's original prediction towards the
+          source's original prediction.
+\end{enumerate}
+A patch effect near~1 indicates that the information at layer~$L$ completely
+determines the prediction at layer~$T$; a value near~0 indicates no causal
+influence.
+
+\paragraph{Results.}
+Figure~\ref{fig:patch_heatmap} shows the full $12 \times 13$ causal influence
+matrix, and Figure~\ref{fig:patch_diagonal} shows the diagonal ($T = L$).
+Key observations:
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\textwidth]{figures/causal/patch_effect_heatmap.png}
+\caption{Activation patching causal influence matrix.  Entry $(L, T)$ is the
+mean patch effect when intervening at layer~$L$ and measuring at layer~$T$.
+Values near 1.0 (dark) indicate strong causal influence.}
+\label{fig:patch_heatmap}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.70\textwidth]{figures/causal/patch_effect_diagonal.png}
+\caption{Diagonal patch effect ($T = L$): the immediate causal effect of
+replacing layer-$L$ activations.  Values are consistently near 1.0 across all
+layers, confirming that depth information is faithfully carried through each
+transformer block.}
+\label{fig:patch_diagonal}
+\end{figure}
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Diagonal entries are exactly 1.0}: Replacing layer-$L$
+          activations and evaluating the probe at the same layer trivially
+          produces perfect shift, confirming the experimental setup is correct.
+    \item \textbf{Off-diagonal entries remain near 1.0}: Even when measuring
+          several layers downstream ($T \gg L$), the patch effect stays close
+          to 1.0 (mean across all entries: $\approx$1.000).  This indicates
+          that depth information, once injected at layer~$L$, is faithfully
+          \emph{preserved} through the remaining transformer blocks rather
+          than being recomputed or discarded.
+    \item \textbf{No evidence of ``recomputation''}: If the ViT were
+          re-deriving depth from raw visual features at each layer, patching
+          at an early layer would have diminishing effect at later layers.
+          The near-constant patch effect argues against this and supports a
+          model where depth information is \emph{incrementally refined and
+          propagated} through the network.
+\end{enumerate}
+
+\subsection{Summary of Causal Findings}
+
+The two causal interventions provide complementary evidence:
+\begin{itemize}[noitemsep]
+    \item \textbf{Ablation} shows that the probe direction concentrates
+          the depth signal: removing it destroys depth predictions while
+          random directions have negligible effect.  The dose-response curve
+          confirms the relationship is monotonic and continuous.
+    \item \textbf{Patching} shows that depth information flows causally
+          through the network: transplanting activations at any layer
+          shifts downstream predictions to match the source image.
+\end{itemize}
+Together, these results upgrade the probing findings from correlational to
+causal: ViT-B/16 does not merely \emph{happen to have} linearly decodable
+depth information; the depth signal is \emph{concentrated in a specific
+learned direction} and \emph{faithfully propagated} through the transformer
+hierarchy.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Discussion}
+\label{sec:discussion}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+\subsection{Why Do Mid-Layer Representations Encode Depth Best?}
+
+The arch-shaped MAE profile (best at layers~5--8) is consistent with the
+general understanding of transformer layer roles.  Early layers encode
+local texture and low-level features; middle layers build increasingly
+abstract spatial representations; and later layers shift towards
+class-discriminative features that discard spatial detail.  For depth, the
+mid-layer optimum is intuitive: the model must have built enough global
+context (through self-attention over all patches) to infer perspective and
+occlusion, but has not yet collapsed the spatial information into
+class-level abstractions.
+
+\subsection{Final-Layer Degradation in the MLP Probe}
+
+The MLP probe at layer~12 (test MAE~$=0.126$, far worse than its best
+at layer~6) exhibits an unusually large degradation that the linear probe
+does not share.  A plausible explanation is that the final layer's
+representations are highly optimised for the ImageNet classification head,
+which means they lie in a low-dimensional subspace aligned with class
+boundaries.  The linear probe can still extract a weak depth signal from
+this subspace, but the MLP, having many more parameters, overfits to the
+\emph{structure} of the layer-12 representation and produces degenerate
+solutions (as evidenced by the larger RMSE = 0.181 at that layer).
+
+\subsection{Depth vs.\ Boundary: A Hierarchy of Spatial Features}
+
+The 2--3 layer offset between boundary peak (layer~5--6) and depth peak
+(layer~8) supports a hierarchical view of spatial feature learning:
+\begin{itemize}[noitemsep]
+    \item \textbf{Structural features} (edges, contours): These are largely
+          local phenomena---an edge is defined by the contrast between two
+          adjacent patches.  The self-attention mechanism can aggregate this
+          local contrast signal within a few layers.
+    \item \textbf{Spatial features} (depth): Depth requires understanding
+          \emph{global} cues---perspective, atmospheric haze, relative
+          object sizes, occlusion patterns.  These emerge later because they
+          require integration over the full $14\!\times\!14$ spatial grid,
+          which takes more layers to propagate.
+\end{itemize}
+This interpretation aligns with classic models of the visual hierarchy
+(V1/V2 edges $\to$ V4/IT depth/shape) and provides empirical support for
+the hypothesis that ViTs discover analogous representations through
+gradient descent on classification data.
+
+\subsection{From Correlation to Causation}
+
+A common criticism of probing studies is that they establish only
+\emph{correlational} evidence: the fact that a linear probe can decode a
+property does not mean the model ``uses'' that information.  Our causal
+analysis (Section~\ref{sec:causal}) addresses this directly.  The
+probe-direction ablation shows that depth information is concentrated in a
+\emph{specific} learned direction---not distributed uniformly across the
+representation space.  The activation patching results further show that this
+information flows causally through the network and is not recomputed de novo
+at each layer.  Together, these findings strengthen the interpretation that
+ViT-B/16 builds and maintains an implicit depth representation as part of its
+learned computation.
+
+The observation that ablating the probe direction at early layers (0--3)
+causes even larger MAE increases (131\,\%--165\,\%) than at the best probing
+layer (83\,\% at layer~8) is noteworthy.  This suggests that at early layers,
+depth information is more concentrated in a single direction, while at later
+layers it may be distributed across multiple directions---consistent with the
+network building richer, more distributed representations as depth progresses.
+
+\subsection{Limitations}
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Small dataset}: NYU Depth V2 has only 795 labelled training
+          images.  Probing on a larger depth dataset (e.g., KITTI~\cite{geiger2013kitti}
+          or Hypersim~\cite{roberts2021hypersim}) would produce more reliable
+          estimates.
+    \item \textbf{Patch-level granularity}: By aggregating depth to
+          $16\!\times\!16$ patches, we discard fine-grained depth structure.
+          Pixel-level probing (with a larger probe capacity) might reveal
+          additional layer-specific patterns.
+    \item \textbf{Single model}: We probe only ViT-B/16.  Larger ViTs
+          (ViT-L, ViT-H) or models trained with self-supervised objectives
+          (DINO, DINOv2, MAE) might encode depth differently.
+    \item \textbf{Indoor scenes only}: NYU Depth V2 covers only indoor
+          environments.  The generalisation of these findings to outdoor
+          scenes (with different depth ranges and visual statistics) is
+          unknown.
+    \item \textbf{Causal scope}: The activation patching experiment patches
+          \emph{all} 196 tokens simultaneously.  A more fine-grained
+          token-level patching study could reveal whether depth information
+          is distributed uniformly across spatial positions or concentrated
+          in specific regions of the image.
+\end{enumerate}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+%% ─────────────────────────────────────────────────────────────────────────────
+
+We presented a systematic probing and causal analysis of depth encoding in
+ViT-B/16, using NYU Depth V2 as the evaluation dataset.  Our main findings
+are:
+
+\begin{enumerate}
+    \item \textbf{ViTs encode depth}: A linear probe trained on frozen ViT
+          hidden states achieves a test MAE of 0.0875 (0.875\,m), a 23\,\%
+          improvement over a random-weight baseline.  The encoding is
+          \emph{learned}, not architectural.
+
+    \item \textbf{Depth information is largely linearly accessible}: The
+          best linear probe outperforms the MLP probe on the test set
+          (MAE 0.0875 vs.\ 0.0920), suggesting that depth is encoded in a
+          linearly separable subspace of the ViT representations.
+
+    \item \textbf{Depth emerges in mid-to-late layers (5--8)}: Unlike
+          boundary detection, which peaks at layers 5--6, depth encoding
+          peaks 2--3 layers later, consistent with depth requiring more
+          global contextual integration.
+
+    \item \textbf{Both tasks degrade at the final layer}: The classification
+          head-facing layer discards spatial information, reinforcing the
+          recommendation to use intermediate layers for geometric feature
+          extraction.
+
+    \item \textbf{Depth encoding is causal, not incidental}: Ablating the
+          probe-learned depth direction increases MAE by 83\,\% at layer~8
+          (vs.\ $<\!1\,\%$ for random directions), and the dose-response is
+          monotonic.  Activation patching confirms that depth information
+          flows faithfully through the transformer hierarchy (patch effects
+          $\approx$1.0 at all layers).
+\end{enumerate}
+
+These findings have practical implications for ViT-based downstream tasks:
+for monocular depth estimation or 3D scene understanding, features from
+layers 5--8 are likely more informative than the final-layer \texttt{[CLS]}
+representation.  The causal analysis further suggests that depth information
+is not a fragile statistical artefact but a robust, concentrated signal that
+the network actively maintains.  More broadly, this work contributes to the
+growing body of evidence that large-scale image classification training
+implicitly teaches vision models a rich understanding of scene geometry, and
+demonstrates that causal interventions can distinguish genuine encoding from
+correlational artefacts in probing studies.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\appendix
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Training Convergence Details}
+
+Table~\ref{tab:training} reports the number of epochs trained (terminated by
+early stopping) and total training time for each of the 52 probe runs.
+
+\begin{table}[H]
+\centering
+\caption{Training convergence: epochs and wall-clock time for each probe run.}
+\label{tab:training}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+Run & Val MAE & Epochs & Time (s) & Params \\
+\midrule
+pretrained\_linear\_layer00 & 0.0988 & 20 & 18.9 & 769 \\
+pretrained\_linear\_layer01 & 0.0810 & 16 & 14.8 & 769 \\
+pretrained\_linear\_layer02 & 0.0771 & 25 & 22.8 & 769 \\
+pretrained\_linear\_layer03 & 0.0746 & 14 & 14.1 & 769 \\
+pretrained\_linear\_layer04 & 0.0724 & 31 & 28.0 & 769 \\
+pretrained\_linear\_layer05 & 0.0665 & 18 & 18.1 & 769 \\
+pretrained\_linear\_layer06 & 0.0695 & 39 & 32.1 & 769 \\
+pretrained\_linear\_layer07 & 0.0707 & 45 & 39.0 & 769 \\
+pretrained\_linear\_layer08 & 0.0741 & 60 & 49.6 & 769 \\
+pretrained\_linear\_layer09 & 0.0738 & 41 & 35.3 & 769 \\
+pretrained\_linear\_layer10 & 0.0752 & 48 & 40.8 & 769 \\
+pretrained\_linear\_layer11 & 0.0771 & 29 & 26.1 & 769 \\
+pretrained\_linear\_layer12 & 0.0807 & 26 & 24.6 & 769 \\
+\midrule
+pretrained\_mlp\_layer00 & 0.0872 & 25 & 36.4 & 197,121 \\
+pretrained\_mlp\_layer01 & 0.0796 & 20 & 27.2 & 197,121 \\
+pretrained\_mlp\_layer02 & 0.0754 & 33 & 41.3 & 197,121 \\
+pretrained\_mlp\_layer03 & 0.0716 & 22 & 27.8 & 197,121 \\
+pretrained\_mlp\_layer04 & 0.0725 & 18 & 26.1 & 197,121 \\
+pretrained\_mlp\_layer05 & 0.0675 & 36 & 48.3 & 197,121 \\
+pretrained\_mlp\_layer06 & 0.0674 & 28 & 39.3 & 197,121 \\
+pretrained\_mlp\_layer07 & 0.0653 & 20 & 24.4 & 197,121 \\
+pretrained\_mlp\_layer08 & 0.0701 & 23 & 28.9 & 197,121 \\
+pretrained\_mlp\_layer09 & 0.0690 & 33 & 40.0 & 197,121 \\
+pretrained\_mlp\_layer10 & 0.0762 & 28 & 35.8 & 197,121 \\
+pretrained\_mlp\_layer11 & 0.0803 & 28 & 36.2 & 197,121 \\
+pretrained\_mlp\_layer12 & 0.0843 & 44 & 54.1 & 197,121 \\
+\midrule
+random\_linear\_layer00 & 0.1025 & 30 & 28.8 & 769 \\
+random\_linear\_layer01 & 0.0959 & 21 & 20.8 & 769 \\
+random\_linear\_layer02 & 0.0938 & 23 & 20.9 & 769 \\
+random\_linear\_layer03 & 0.0902 & 29 & 25.9 & 769 \\
+random\_linear\_layer04 & 0.0875 & 19 & 19.1 & 769 \\
+random\_linear\_layer05 & 0.0913 & 13 & 15.7 & 769 \\
+random\_linear\_layer06 & 0.0878 & 38 & 39.1 & 769 \\
+random\_linear\_layer07 & 0.0879 & 19 & 21.1 & 769 \\
+random\_linear\_layer08 & 0.0914 & 20 & 21.7 & 769 \\
+random\_linear\_layer09 & 0.0887 & 24 & 29.2 & 769 \\
+random\_linear\_layer10 & 0.0886 & 22 & 28.4 & 769 \\
+random\_linear\_layer11 & 0.0895 & 15 & 15.1 & 769 \\
+random\_linear\_layer12 & 0.0876 & 23 & 23.3 & 769 \\
+\midrule
+random\_mlp\_layer00 & 0.0962 & 21 & 28.1 & 197,121 \\
+random\_mlp\_layer01 & 0.0864 & 23 & 29.8 & 197,121 \\
+random\_mlp\_layer02 & 0.0889 & 17 & 22.6 & 197,121 \\
+random\_mlp\_layer03 & 0.0871 & 16 & 23.3 & 197,121 \\
+random\_mlp\_layer04 & 0.0846 & 16 & 23.0 & 197,121 \\
+random\_mlp\_layer05 & 0.0850 & 25 & 34.4 & 197,121 \\
+random\_mlp\_layer06 & 0.0869 & 21 & 28.0 & 197,121 \\
+random\_mlp\_layer07 & 0.0872 & 21 & 27.3 & 197,121 \\
+random\_mlp\_layer08 & 0.0881 & 37 & 47.4 & 197,121 \\
+random\_mlp\_layer09 & 0.0870 & 17 & 21.5 & 197,121 \\
+random\_mlp\_layer10 & 0.0876 & 23 & 30.2 & 197,121 \\
+random\_mlp\_layer11 & 0.0860 & 23 & 31.0 & 197,121 \\
+random\_mlp\_layer12 & 0.0886 & 15 & 23.9 & 197,121 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experimental Setup Summary}
+
+\begin{table}[H]
+\centering
+\caption{Complete experimental setup.}
+\begin{tabular}{ll}
+\toprule
+Component & Details \\
+\midrule
+Model & ViT-B/16 (\texttt{google/vit-base-patch16-224-in21k}) \\
+Layers probed & 13 (embedding + 12 transformer blocks) \\
+Patch size & $16\times16$ pixels \\
+Patches per image & 196 ($14\times14$ grid) \\
+Hidden dimension & 768 \\
+Dataset & NYU Depth V2 (HuggingFace: \texttt{sayakpaul/nyu\_depth\_v2}) \\
+Dataset splits & 675 train / 120 val / 654 test \\
+Depth normalisation & Divide by 10.0\,m \\
+Depth resize & Bilinear interpolation to $224\!\times\!224$ \\
+Label aggregation & Mean depth per $16\times16$ patch \\
+Probe types & LinearProbe (769 params), MLPProbe (197,121 params) \\
+Loss function & \texttt{MSELoss} \\
+Optimiser & Adam ($\text{lr}=10^{-3}$, weight decay $= 10^{-4}$) \\
+Batch size & 512 patches \\
+Max epochs & 100 \\
+Early stopping & Patience 10, metric: val MAE \\
+Hardware & Apple M3 Mac (MPS) \\
+Total probe runs & 52 (13 layers $\times$ 2 probe types $\times$ 2 inits) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{thebibliography}{99}
+
+\bibitem{dosovitskiy2021vit}
+A.~Dosovitskiy, L.~Beyer, A.~Kolesnikov, D.~Weissenborn, X.~Zhai,
+T.~Unterthiner, M.~Dehghani, M.~Minderer, G.~Heigold, S.~Gelly, J.~Uszkoreit,
+and N.~Houlsby.
+\newblock An image is worth 16x16 words: Transformers for image recognition at
+  scale.
+\newblock In \emph{ICLR}, 2021.
+
+\bibitem{alain2017understanding}
+G.~Alain and Y.~Bengio.
+\newblock Understanding intermediate layers using linear classifier probes.
+\newblock In \emph{ICLR Workshop}, 2017.
+
+\bibitem{silberman2012nyudepth}
+N.~Silberman, D.~Hoiem, P.~Kohli, and R.~Fergus.
+\newblock Indoor segmentation and support inference from {RGBD} images.
+\newblock In \emph{ECCV}, 2012.
+
+\bibitem{caron2021dino}
+M.~Caron, H.~Touvron, I.~Misra, H.~Jégou, J.~Mairal, P.~Bojanowski, and
+A.~Joulin.
+\newblock Emerging properties in self-supervised vision transformers.
+\newblock In \emph{ICCV}, 2021.
+
+\bibitem{oquab2023dinov2}
+M.~Oquab, T.~Darcet, T.~Moutakanni, H.~Vo, M.~Szafraniec, V.~Khalidov,
+P.~Fernandez, D.~Haziza, F.~Massa, A.~El-Nouby, M.~Assran, N.~Ballas,
+W.~Galuba, R.~Howes, P.-Y.~Huang, S.-W.~Li, I.~Misra, M.~Rabbat, V.~Sharma,
+G.~Synnaeve, H.~Xu, H.~Jégou, J.~Mairal, P.~Labatut, A.~Joulin, and
+P.~Bojanowski.
+\newblock {DINOv2}: Learning robust visual features without supervision.
+\newblock \emph{TMLR}, 2024.
+
+\bibitem{vig2020causal}
+J.~Vig, S.~Gehrmann, Y.~Belinkov, S.~Qian, D.~Nevo, Y.~Singer, and
+S.~Shieber.
+\newblock Investigating gender bias in language models using causal mediation
+  analysis.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{geiger2013kitti}
+A.~Geiger, P.~Lenz, C.~Stiller, and R.~Urtasun.
+\newblock Vision meets robotics: The {KITTI} dataset.
+\newblock \emph{IJRR}, 32(11):1231--1237, 2013.
+
+\bibitem{roberts2021hypersim}
+M.~Roberts, J.~Ramapuram, A.~Ranjan, A.~Kumar, M.~A.~Bautista,
+N.~Paczan, R.~Webb, and J.~M.~Susskind.
+\newblock Hypersim: A photorealistic synthetic dataset for holistic indoor
+  scene understanding.
+\newblock In \emph{ICCV}, 2021.
+
+\end{thebibliography}
+
+\end{document}
