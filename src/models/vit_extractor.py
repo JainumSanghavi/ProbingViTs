@@ -78,3 +78,30 @@ class ViTExtractor:
 
         result = self.extract(pixel_values)  # (13, 1, 196, 768)
         return result.squeeze(1)  # (13, 196, 768)
+
+    @torch.no_grad()
+    def extract_with_hook(self, pixel_values: torch.Tensor, hook_fn, layer_idx: int) -> torch.Tensor:
+        """Extract hidden states with a forward hook on a specific encoder layer.
+
+        The hook intercepts the output of encoder.layer[layer_idx] during the
+        forward pass, allowing activation patching. Downstream layers see the
+        modified activations.
+
+        Args:
+            pixel_values: Single image tensor (3, 224, 224) or (1, 3, 224, 224).
+            hook_fn: Callable(module, input, output) -> modified output.
+            layer_idx: Index into self.model.encoder.layer (0-11).
+                       Our "layer L" maps to encoder.layer[L-1] for L>=1.
+
+        Returns:
+            Tensor of shape (13, 196, 768) with patched downstream activations.
+        """
+        if pixel_values.dim() == 3:
+            pixel_values = pixel_values.unsqueeze(0)
+
+        handle = self.model.encoder.layer[layer_idx].register_forward_hook(hook_fn)
+        try:
+            result = self.extract(pixel_values)  # (13, 1, 196, 768)
+        finally:
+            handle.remove()
+        return result.squeeze(1)  # (13, 196, 768)
