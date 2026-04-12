@@ -1,11 +1,16 @@
-"""Activation patching study for depth probing.
+"""Targeted activation patching: swap only the depth-direction component.
 
-Tests whether depth information at layer L causally propagates to downstream
-layers by replacing activations from a 'source' image with those from a
-'destination' image at layer L and measuring the downstream depth prediction shift.
+Instead of replacing all 196 patch tokens (which trivially shifts predictions),
+we replace ONLY the 1D depth-direction component at layer L:
 
-Produces a 12x12 lower-triangular matrix of patch effects: rows = intervention
-layer L (1-12), columns = target layer T (L..12).
+    h_patched = h_source + (proj_w(h_dest) - proj_w(h_source))
+
+where proj_w(h) = (h . w_hat) * w_hat is the projection onto the probe's
+weight direction.  This keeps the other 767 dimensions from the source intact.
+
+If depth predictions shift -> the depth direction at layer L causally drives
+downstream depth predictions.  If they don't -> the model re-derives depth
+from other features at later layers.
 """
 
 import json
@@ -25,9 +30,7 @@ from src.probes.linear_probe import get_probe
 
 
 def _select_pairs(config: dict, n_near: int = 10, n_far: int = 10):
-    """Select image pairs with maximum depth contrast from test set.
-    Returns list of (source_id, dest_id) tuples.
-    """
+    """Select image pairs with maximum depth contrast from test set."""
     labels_dir = Path(config["dataset"]["processed_dir"]) / "depth_labels" / "test"
     ids_and_means = []
     for p in sorted(labels_dir.glob("*.npy")):
@@ -38,7 +41,6 @@ def _select_pairs(config: dict, n_near: int = 10, n_far: int = 10):
     near_ids = [x[0] for x in ids_and_means[:n_near]]
     far_ids = [x[0] for x in ids_and_means[-n_far:]]
 
-    # Pair each near with each far (take first 20 pairs)
     pairs = []
     for n_id in near_ids:
         for f_id in far_ids:
@@ -50,10 +52,11 @@ def _select_pairs(config: dict, n_near: int = 10, n_far: int = 10):
     return pairs
 
 
-def _load_probes(config: dict) -> dict:
-    """Load pretrained linear probe checkpoints for all layers."""
+def _load_probes_and_directions(config: dict):
+    """Load probes and extract normalised weight directions for each layer."""
     checkpoints_dir = Path(config["results"]["checkpoints_dir"])
     probes = {}
+    directions = {}
     for layer in config["training"]["layers"]:
         ckpt = checkpoints_dir / f"pretrained_linear_layer{layer:02d}.pt"
         if ckpt.exists():
@@ -62,7 +65,9 @@ def _load_probes(config: dict) -> dict:
             probe.load_state_dict(state)
             probe.eval()
             probes[layer] = probe
-    return probes
+            w = state["linear.weight"].squeeze(0).float()
+            directions[layer] = w / w.norm()
+    return probes, directions
 
 
 def _predict_depth(probe, hidden_states_single_layer):
@@ -79,15 +84,12 @@ def run_patching(config: dict):
     cached_dir = Path(config["dataset"]["cached_dir"]) / "hidden_states" / "pretrained" / "test"
     transform = get_vit_transform(config["model"]["image_size"])
 
-    # Select pairs
     pairs = _select_pairs(config)
     print(f"Selected {len(pairs)} (near, far) image pairs")
 
-    # Load probes
-    probes = _load_probes(config)
-    print(f"Loaded {len(probes)} probe checkpoints")
+    probes, directions = _load_probes_and_directions(config)
+    print(f"Loaded {len(probes)} probe checkpoints + depth directions")
 
-    # Create extractor
     extractor = ViTExtractor(
         model_name=config["model"]["name"],
         pretrained=True,
@@ -95,9 +97,9 @@ def run_patching(config: dict):
     )
 
     layers = config["training"]["layers"]  # [0, 1, ..., 12]
-    intervention_layers = [l for l in layers if l >= 1]  # can't hook embedding (layer 0)
+    intervention_layers = [l for l in layers if l >= 1]  # can't hook layer 0
 
-    # Results: patch_effects[L][T] = list of effects across all pairs
+    # patch_effects[L][T] = list of effects across pairs
     patch_effects = {L: {T: [] for T in layers if T >= L} for L in intervention_layers}
 
     for pair_idx, (source_id, dest_id) in enumerate(pairs):
@@ -113,7 +115,7 @@ def run_patching(config: dict):
         # Get source baseline hidden states (no patching)
         source_hidden = extractor.extract_single(source_pixels).cpu()  # (13, 196, 768)
 
-        # Get destination baseline predictions at each layer
+        # Baseline predictions at each layer
         dest_preds = {}
         source_preds = {}
         for T in layers:
@@ -121,24 +123,32 @@ def run_patching(config: dict):
                 dest_preds[T] = _predict_depth(probes[T], dest_hidden[T])
                 source_preds[T] = _predict_depth(probes[T], source_hidden[T])
 
-        # For each intervention layer L
+        # For each intervention layer L: swap only the depth direction
         for L in intervention_layers:
-            # Build hook that replaces patch tokens at layer L
-            # encoder.layer[L-1] produces what we call "layer L"
+            if L not in directions:
+                continue
+
+            w_hat = directions[L].to(device)  # (768,) unit vector
             dest_patches_L = dest_hidden[L].float().to(device)  # (196, 768)
 
-            def make_hook(dest_patches):
+            def make_hook(w_hat_local, dest_local):
                 def hook_fn(module, input, output):
-                    # output is a tuple: (hidden_states, ...) where hidden_states is (B, 197, 768)
-                    modified = output[0].clone()
-                    modified[:, 1:, :] = dest_patches.unsqueeze(0)  # replace 196 patch tokens
+                    modified = output[0].clone()  # (B, 197, 768)
+                    h_source = modified[:, 1:, :]  # (B, 196, 768) — source patch tokens
+
+                    # Project source and dest onto depth direction
+                    src_proj = (h_source @ w_hat_local).unsqueeze(-1) * w_hat_local  # (B, 196, 768)
+                    dst_proj = (dest_local.unsqueeze(0) @ w_hat_local).unsqueeze(-1) * w_hat_local  # (1, 196, 768)
+
+                    # Swap only the depth component: keep source's other 767 dims
+                    modified[:, 1:, :] = h_source - src_proj + dst_proj
                     return (modified,) + output[1:]
                 return hook_fn
 
-            hook = make_hook(dest_patches_L)
+            hook = make_hook(w_hat, dest_patches_L)
             patched_hidden = extractor.extract_with_hook(source_pixels, hook, layer_idx=L-1).cpu()
 
-            # Measure patch effect at each target layer T >= L
+            # Measure effect at each downstream layer T >= L
             for T in layers:
                 if T < L or T not in probes:
                     continue
@@ -147,21 +157,21 @@ def run_patching(config: dict):
                 source_pred = source_preds[T]
                 dest_pred = dest_preds[T]
 
-                # Patch effect: how much did prediction shift toward destination?
                 shift = float(np.abs(patched_pred - source_pred).mean())
                 total_gap = float(np.abs(dest_pred - source_pred).mean())
                 effect = shift / max(total_gap, 1e-8)
 
                 patch_effects[L][T].append(effect)
 
-    # Aggregate across pairs
+    # Aggregate
     results = {
         "pairs": [{"source": s, "dest": d} for s, d in pairs],
         "n_pairs": len(pairs),
+        "intervention_type": "depth_direction_only",
         "patch_effects": {},
     }
 
-    print("\n=== PATCH EFFECT MATRIX (mean across pairs) ===")
+    print("\n=== TARGETED PATCH EFFECT MATRIX (mean across pairs) ===")
     print(f"{'L\\T':<6}", end="")
     for T in layers:
         print(f"T={T:<5}", end="")
@@ -174,6 +184,9 @@ def run_patching(config: dict):
                 print(f"{'---':<7}", end="")
             else:
                 effects = patch_effects[L][T]
+                if not effects:
+                    print(f"{'---':<7}", end="")
+                    continue
                 mean_eff = float(np.mean(effects))
                 std_eff = float(np.std(effects))
                 key = f"L{L:02d}_T{T:02d}"
