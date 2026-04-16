@@ -8,26 +8,38 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+_METRIC_DISPLAY = {
+    "average_precision": ("AP (PR-AUC)", "ap"),
+    "f1": ("F1", "f1"),
+    "accuracy": ("Accuracy", "accuracy"),
+}
+
+
 def plot_layerwise_metrics(
     results: Dict,
     baseline_metrics: Dict,
     save_dir: str,
-    metrics_to_plot: list = ["f1", "accuracy"],
+    metrics_to_plot: list = ["average_precision", "accuracy"],
 ):
     """Plot probe performance across layers with baselines.
 
     Creates the main results figure showing how boundary detection
-    accuracy varies across ViT layers.
+    performance varies across ViT layers.
 
     Args:
         results: Nested dict results[model_type][probe_type][layer] = metrics
         baseline_metrics: Dict with baseline results
         save_dir: Directory to save figures
+        metrics_to_plot: Metrics to plot; defaults to AP (PR-AUC) and accuracy
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     for metric_name in metrics_to_plot:
+        display_label, file_suffix = _METRIC_DISPLAY.get(
+            metric_name, (metric_name.replace("_", " ").title(), metric_name)
+        )
+
         fig, ax = plt.subplots(figsize=(10, 6))
 
         # Plot each model_type x probe_type combination
@@ -51,26 +63,28 @@ def plot_layerwise_metrics(
         # Plot baselines as horizontal lines
         if "majority_class" in baseline_metrics:
             val = baseline_metrics["majority_class"].get(metric_name, 0)
-            ax.axhline(y=val, color="gray", linestyle=":", linewidth=1.5,
-                       label=f"majority class ({val:.3f})")
+            if val:
+                ax.axhline(y=val, color="gray", linestyle=":", linewidth=1.5,
+                           label=f"majority class ({val:.3f})")
 
         if "random" in baseline_metrics:
             val = baseline_metrics["random"].get(metric_name, 0)
-            ax.axhline(y=val, color="gray", linestyle="-.", linewidth=1.5,
-                       label=f"random ({val:.3f})")
+            if val:
+                ax.axhline(y=val, color="gray", linestyle="-.", linewidth=1.5,
+                           label=f"random ({val:.3f})")
 
         ax.set_xlabel("ViT Layer", fontsize=12)
-        ax.set_ylabel(metric_name.replace("_", " ").title(), fontsize=12)
-        ax.set_title(f"Boundary Detection Probe: {metric_name.replace('_', ' ').title()} by Layer", fontsize=14)
+        ax.set_ylabel(display_label, fontsize=12)
+        ax.set_title(f"Boundary Detection Probe: {display_label} by Layer", fontsize=14)
         ax.set_xticks(range(13))
         ax.set_xticklabels([f"L{i}" for i in range(13)])
         ax.legend(loc="best", fontsize=10)
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        fig.savefig(save_dir / f"layerwise_{metric_name}.png", dpi=150, bbox_inches="tight")
+        fig.savefig(save_dir / f"layerwise_{file_suffix}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
-        print(f"  Saved: layerwise_{metric_name}.png")
+        print(f"  Saved: layerwise_{file_suffix}.png")
 
 
 def plot_layerwise_comparison(

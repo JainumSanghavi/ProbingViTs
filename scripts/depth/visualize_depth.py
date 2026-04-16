@@ -153,18 +153,20 @@ def plot_cross_task(depth_results: dict, figures_dir: Path):
     if "pretrained" in boundary_results and "linear" in boundary_results["pretrained"]:
         lm = boundary_results["pretrained"]["linear"]
         layers = sorted(lm.keys())
-        if not layers or "f1" not in lm.get(layers[0], {}):
-            print("  Warning: boundary results missing 'f1' key, skipping boundary curve")
+        metric_key = "average_precision" if "average_precision" in lm.get(layers[0], {}) else "f1"
+        if not layers or metric_key not in lm.get(layers[0], {}):
+            print("  Warning: boundary results missing AP/F1 key, skipping boundary curve")
         else:
-            ax1.plot(layers, [lm[l]["f1"] for l in layers],
-                     color="green", marker="o", linewidth=2, label="Boundary F1 (pretrained linear)")
+            label_str = "Boundary AP / PR-AUC (pretrained linear)" if metric_key == "average_precision" else "Boundary F1 (pretrained linear)"
+            ax1.plot(layers, [lm[l][metric_key] for l in layers],
+                     color="green", marker="o", linewidth=2, label=label_str)
     if "pretrained" in depth_results and "linear" in depth_results["pretrained"]:
         lm = depth_results["pretrained"]["linear"]
         layers = sorted(lm.keys())
         ax2.plot(layers, [lm[l]["mae"] for l in layers],
                  color="purple", marker="s", linewidth=2, linestyle="--", label="Depth MAE (pretrained linear)")
     ax1.set_xlabel("ViT Layer", fontsize=12)
-    ax1.set_ylabel("Boundary F1 (higher = better)", fontsize=12, color="green")
+    ax1.set_ylabel("Boundary AP / PR-AUC (higher = better)", fontsize=12, color="green")
     ax2.set_ylabel("Depth MAE (lower = better)", fontsize=12, color="purple")
     ax1.set_xticks(range(13))
     ax1.set_xticklabels([f"L{i}" for i in range(13)])
